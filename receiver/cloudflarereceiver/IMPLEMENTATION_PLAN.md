@@ -1,9 +1,11 @@
 # Cloudflare Receiver - Metrics Implementation Plan
 
 ## Overview
+
 Extend the existing Cloudflare receiver to support metrics collection from Cloudflare Analytics API. The receiver currently supports logs via LogPush; this implementation adds metrics collection for zones and WAF analytics.
 
 ## Context
+
 - **Existing Component**: Cloudflare receiver (logs only, alpha stability)
 - **New Capability**: Add metrics scraping from Cloudflare Analytics API
 - **SDK**: Use `github.com/cloudflare/cloudflare-go/v6` for API interaction
@@ -11,16 +13,19 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 - **Stability Target**: Development → Alpha
 
 ## Goals
+
 1. Add metrics collection capability to existing cloudflarereceiver
 2. Support Account-level analytics (requests, bandwidth, threats)
 3. Support Zone analytics (bandwidth, requests, threats, pageviews)
-4. Support WAF analytics (events, rules, actions)
-5. Use Cloudflare Go SDK v6 for all API interactions
-6. Auto-discover all zones in account by default with zone filtering support
-7. Design for extensibility (easy to add Workers, R2, Logpush metrics later)
-8. Maintain separation from existing logs functionality
+4. Support Firewall/WAF analytics (by action and source - low cardinality)
+5. Use Cloudflare Go SDK v6 for REST API interactions
+6. Use GraphQL API directly (via HTTP client) for firewall analytics
+7. Auto-discover all zones in account by default with zone filtering support
+8. Design for extensibility (easy to add Workers, R2, Logpush metrics later)
+9. Maintain separation from existing logs functionality
 
 ## Non-Goals (Future Extensions)
+
 - Workers metrics
 - R2 storage metrics
 - Logpush job metrics
@@ -29,14 +34,17 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 ---
 
 ## Stage 1: Foundation & Configuration
+
 **Goal**: Set up basic structure for metrics collection without breaking existing logs functionality
 **Success Criteria**:
+
 - Configuration validates correctly for metrics
 - Factory registers metrics receiver
 - All existing tests pass
 - New metrics config documented
 
 **Tasks**:
+
 1. Update `config.go`:
    - Add `MetricsConfig` struct with fields:
      - `api_token` (string, required): Cloudflare API token
@@ -45,7 +53,7 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
      - `exclude_zones` ([]string, optional): List of zone IDs to exclude from monitoring
      - `enable_account_metrics` (bool, default: true): Enable account-level metrics
      - `enable_zone_metrics` (bool, default: true): Enable per-zone metrics
-     - `enable_waf_metrics` (bool, default: true): Enable WAF metrics per zone
+     - `enable_firewall_metrics` (bool, default: true): Enable firewall/WAF metrics per zone
    - Add validation for metrics config:
      - Require `api_token`
      - Require `account_id`
@@ -75,6 +83,7 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
      - Logs and metrics together
 
 **Tests**:
+
 - Config validation for metrics config
 - Factory creates metrics receiver
 - Backward compatibility test for logs-only config
@@ -84,30 +93,40 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 ---
 
 ## Stage 2: Cloudflare SDK Integration & Client
+
 **Goal**: Implement Cloudflare API client wrapper using cloudflare-go/v6 SDK
 **Success Criteria**:
+
 - Client successfully authenticates with Cloudflare API
 - Client can list zones for an account
 - Client handles API errors gracefully
 - Unit tests with mocked API responses
 
 **Tasks**:
+
 1. Add dependency:
    - Run `go get github.com/cloudflare/cloudflare-go/v6`
    - Update `go.mod` and `go.sum`
 
 2. Create `internal/client/cloudflare_client.go`:
    - Interface definition:
+
      ```go
      type CloudflareClient interface {
+         // REST API methods (using cloudflare-go SDK)
          ListZones(ctx context.Context, accountID string) ([]Zone, error)
          GetAccountAnalytics(ctx context.Context, accountID string, params AnalyticsParams) (AccountAnalytics, error)
          GetZoneAnalytics(ctx context.Context, zoneID string, params AnalyticsParams) (ZoneAnalytics, error)
-         GetWAFAnalytics(ctx context.Context, zoneID string, params AnalyticsParams) (WAFAnalytics, error)
+
+         // GraphQL API methods (using direct HTTP client)
+         GetFirewallEventsByAction(ctx context.Context, zoneID string, params AnalyticsParams) (FirewallAnalytics, error)
+         GetFirewallEventsBySource(ctx context.Context, zoneID string, params AnalyticsParams) (FirewallAnalytics, error)
      }
      ```
-   - Implement client using cloudflare-go SDK
-   - Handle authentication with API token
+
+   - Implement REST client using cloudflare-go SDK
+   - Implement GraphQL client using net/http (see GRAPHQL_RESEARCH.md)
+   - Handle authentication with API token for both clients
    - Implement rate limiting and retries
    - Add logging for API calls
    - Implement zone filtering logic (zones/exclude_zones)
@@ -116,21 +135,29 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
    - `Zone` struct (ID, Name, Status)
    - `AccountAnalytics` struct (account-level bandwidth, requests, threats)
    - `ZoneAnalytics` struct (per-zone bandwidth, requests, threats, pageviews)
-   - `WAFAnalytics` struct (events, rules, actions)
+   - `FirewallAnalytics` struct (aggregated by action/source, NOT by rule_id)
    - `AnalyticsParams` struct (time ranges, filters)
 
-4. Create `internal/client/cloudflare_client_test.go`:
-   - Test authentication
+4. Create `internal/client/graphql_client.go` (separate file for GraphQL):
+   - Simple GraphQL client using net/http
+   - Methods: `Query()`, `GetFirewallEvents()`
+   - Type-safe response parsing
+   - Error handling for GraphQL errors
+   - See GRAPHQL_RESEARCH.md for implementation example
+
+5. Create `internal/client/cloudflare_client_test.go`:
+   - Test authentication (REST and GraphQL)
    - Test zone listing and auto-discovery
    - Test zone filtering (zones parameter)
    - Test zone exclusion (exclude_zones parameter)
    - Test account analytics fetching
    - Test zone analytics fetching
-   - Test WAF analytics fetching
-   - Test error handling
-   - Mock Cloudflare API responses
+   - Test firewall analytics fetching (GraphQL)
+   - Test error handling for both REST and GraphQL
+   - Mock Cloudflare API responses (REST and GraphQL)
 
 **Tests**:
+
 - Unit tests for client methods
 - Error handling tests
 - Mock-based tests (no real API calls)
@@ -140,14 +167,17 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 ---
 
 ## Stage 3: Metrics Scraper Implementation
+
 **Goal**: Implement metrics scraper that polls Cloudflare API and generates OTEL metrics
 **Success Criteria**:
+
 - Scraper successfully fetches analytics from Cloudflare
 - Scraper converts Cloudflare data to OTEL metrics format
 - Scraper handles errors and retries
 - Integration test with mocked client
 
 **Tasks**:
+
 1. Create `metrics.go`:
    - Implement `metricsReceiver` struct with:
      - scraperhelper.ScraperControllerSettings
@@ -162,12 +192,13 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
      - Fetch account-level analytics if `enable_account_metrics` is true
      - Auto-discover zones from account (filter by `zones` or `exclude_zones`)
      - For each zone:
-       - Fetch zone analytics if `enable_zone_metrics` is true
-       - Fetch WAF analytics if `enable_waf_metrics` is true
+       - Fetch zone analytics if `enable_zone_metrics` is true (REST API)
+       - Fetch firewall analytics if `enable_firewall_metrics` is true (GraphQL API)
      - Convert to OTEL metrics
    - Handle pagination if needed
    - Implement error handling and logging
    - Log zone discovery results (how many zones found/filtered)
+   - Handle mixed success (some zones succeed, others fail)
 
 3. Create metric conversion functions:
    - `accountAnalyticsToMetrics(accountID string, analytics AccountAnalytics) pmetric.Metrics`
@@ -187,11 +218,13 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
        - `cloudflare.zone.requests.uncached` (Sum, count)
        - `cloudflare.zone.threats.total` (Sum, count)
        - `cloudflare.zone.pageviews.total` (Sum, count)
-   - `wafAnalyticsToMetrics(zone Zone, analytics WAFAnalytics) pmetric.Metrics`
-     - WAF metrics (with zone_id, zone_name, action, rule attributes):
-       - `cloudflare.waf.requests.total` (Sum, count)
-       - `cloudflare.waf.requests.by_action` (Sum, count, dimension: action)
-       - `cloudflare.waf.requests.by_rule` (Sum, count, dimension: rule_id)
+   - `firewallAnalyticsToMetrics(zone Zone, analytics FirewallAnalytics) pmetric.Metrics`
+     - Firewall/WAF metrics (with zone_id, zone_name as attributes):
+       - `cloudflare.zone.firewall.requests.total` (Sum, count)
+       - `cloudflare.zone.firewall.requests.by_action` (Sum, count, dimension: action)
+         - Actions: allow, block, challenge, jschallenge, log, connectionClose
+       - `cloudflare.zone.firewall.requests.by_source` (Sum, count, dimension: source)
+         - Sources: waf, firewallRules, rateLimit, securityLevel, etc.
 
 4. Handle time ranges:
    - Use `collection_interval` to determine time range for analytics
@@ -199,29 +232,35 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
    - Handle clock drift and API delays
 
 **Tests**:
-- Unit tests for metric conversion (account, zone, WAF)
+
+- Unit tests for metric conversion (account, zone, firewall)
 - Test zone auto-discovery and filtering
 - Test zone exclusion logic
-- Integration test with mocked client
-- Test error scenarios (API failures, partial data)
+- Integration test with mocked client (REST and GraphQL)
+- Test error scenarios (API failures, partial data, GraphQL errors)
 - Test metric attributes and values
 - Test with account metrics disabled
-- Test with zone/WAF metrics disabled
+- Test with zone/firewall metrics disabled
+- Test low cardinality of firewall metrics (no rule_id dimension)
 
 **Status**: Not Started
 
 ---
 
 ## Stage 4: Metrics Metadata Definition
+
 **Goal**: Define metrics in metadata.yaml for code generation
 **Success Criteria**:
+
 - All metrics defined in metadata.yaml
 - mdatagen generates correct code
 - Metrics builder works correctly
 
 **Tasks**:
+
 1. Update `metadata.yaml`:
    - Add `resource_attributes` section:
+
      ```yaml
      resource_attributes:
        cloudflare.account.id:
@@ -233,10 +272,17 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
        cloudflare.zone.name:
          description: Cloudflare zone name
          type: string
+       cloudflare.firewall.action:
+         description: Firewall action taken (allow, block, challenge, etc.)
+         type: string
+       cloudflare.firewall.source:
+         description: Source of firewall event (waf, firewallRules, rateLimit, etc.)
+         type: string
      ```
-   - Add `metrics` section with all account, zone, and WAF metrics
+
+   - Add `metrics` section with all account, zone, and firewall metrics
    - Define metric types (sum/gauge), units (bytes/count), descriptions
-   - Add optional attributes (action, rule_id, etc.)
+   - Add optional attributes (action, source) - NO rule_id for cardinality reasons
 
 2. Run code generation:
    - Execute `go generate ./...` to generate metadata code
@@ -247,6 +293,7 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
    - Use `metadata.Metrics` builder pattern
 
 **Tests**:
+
 - Verify generated code compiles
 - Test metric builders
 - Validate metadata structure
@@ -256,14 +303,17 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 ---
 
 ## Stage 5: Integration & Testing
+
 **Goal**: Complete integration testing and documentation
 **Success Criteria**:
+
 - Full integration test with collector
 - Example configuration works end-to-end
 - README.md complete and accurate
 - All tests pass
 
 **Tasks**:
+
 1. Create `metrics_test.go`:
    - Test full receiver lifecycle
    - Test with sample configuration
@@ -297,6 +347,7 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
      - Full pipeline example
 
 **Tests**:
+
 - Integration tests pass
 - Load test with multiple zones
 - Error recovery test
@@ -307,14 +358,17 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 ---
 
 ## Stage 6: Code Quality & Submission
+
 **Goal**: Ensure code quality and prepare for PR submission
 **Success Criteria**:
+
 - All linters pass
 - Code coverage >80%
 - CHANGELOG updated
 - PR ready for review
 
 **Tasks**:
+
 1. Code quality:
    - Run `make lint` and fix all issues
    - Run `make test` and ensure all tests pass
@@ -349,6 +403,7 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
    - Ensure CI passes
 
 **Tests**:
+
 - All existing tests still pass
 - New tests have good coverage
 - CI pipeline succeeds
@@ -360,16 +415,20 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 ## Design Decisions
 
 ### 1. Configuration Structure
+
 **Decision**: Add `MetricsConfig` as a sibling to `LogsConfig` in main `Config` struct
 **Rationale**:
+
 - Maintains clear separation of concerns
 - Allows users to enable logs, metrics, or both independently
 - Follows pattern seen in other multi-signal receivers
 - Easy to extend with more config options later
 
 ### 2. Cloudflare SDK vs Direct API
+
 **Decision**: Use `github.com/cloudflare/cloudflare-go/v6` SDK
 **Rationale**:
+
 - Official SDK from Cloudflare
 - Handles authentication, rate limiting, retries
 - Type-safe API interactions
@@ -377,16 +436,20 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 - Reduces custom HTTP client code
 
 ### 3. Metric Naming Convention
+
 **Decision**: Use `cloudflare.{category}.{metric}.{aggregation}` pattern
 **Rationale**:
+
 - Clear hierarchy and grouping
 - Follows OTEL semantic conventions
 - Examples: `cloudflare.zone.bandwidth.total`, `cloudflare.waf.requests.total`
 - Easy to query and filter in backends
 
 ### 4. Scraper Pattern
+
 **Decision**: Use `scraperhelper.Scraper` from collector framework
 **Rationale**:
+
 - Standard pattern for polling-based receivers
 - Built-in collection interval handling
 - Lifecycle management (start/stop)
@@ -394,16 +457,20 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 - See azuremonitor receiver for reference
 
 ### 5. Time Range Strategy
+
 **Decision**: Use collection_interval as time window for analytics queries
 **Rationale**:
+
 - Aligns with scraper cadence
 - Avoids gaps in data collection
 - Simple to understand and configure
 - Cloudflare Analytics API supports arbitrary time ranges
 
 ### 6. Extensibility Design
+
 **Decision**: Separate client interface and metric converters by category
 **Rationale**:
+
 - Easy to add new metric categories (Workers, R2, etc.) later
 - Each category gets its own converter function
 - Client interface can be extended without breaking existing code
@@ -412,18 +479,23 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 ---
 
 ## Open Questions
+
 1. **Sponsor**: Need to identify a maintainer/approver to sponsor this contribution
-2. **Metric Cardinality**: Should WAF metrics include all rule IDs as dimensions? (May create high cardinality)
-3. **Rate Limiting**: What's the appropriate default collection_interval to avoid Cloudflare rate limits? (Recommendation: 60s)
-4. **Error Handling**: Should partial failures (one zone fails) fail entire scrape or just log error? (Recommendation: Log and continue)
+2. **Rate Limiting**: What's the appropriate default collection_interval to avoid Cloudflare rate limits? (Recommendation: 60s)
+3. **Error Handling**: Should partial failures (one zone fails) fail entire scrape or just log error? (Recommendation: Log and continue)
 
 ## Resolved Questions
+
 1. **Zone Discovery** ✓: Auto-discover all zones by default, support explicit `zones` filter and `exclude_zones` exclusion (matches lablabs/cloudflare-exporter)
 2. **Account Metrics** ✓: Support account-level metrics out of the box (matches lablabs/cloudflare-exporter)
+3. **GraphQL Support** ✓: Implement direct HTTP client (no third-party library needed). See GRAPHQL_RESEARCH.md for details.
+4. **Metric Cardinality** ✓: Use aggregated firewall metrics by action/source only (NO rule_id). Estimated ~220 time series per zone = manageable cardinality.
+5. **WAF/Firewall Metrics** ✓: Include in initial implementation using low-cardinality aggregations (~8-11 hours additional effort)
 
 ---
 
 ## Dependencies
+
 - `github.com/cloudflare/cloudflare-go/v6`: Cloudflare Go SDK
 - `go.opentelemetry.io/collector/receiver/scraperhelper`: Scraper helper framework
 - `go.opentelemetry.io/collector/pdata/pmetric`: OTEL metrics data structures
@@ -431,20 +503,27 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 ---
 
 ## Timeline Estimate
+
 - Stage 1: 4-6 hours
-- Stage 2: 6-8 hours
-- Stage 3: 8-10 hours
-- Stage 4: 3-4 hours
+- Stage 2: 14-19 hours (includes GraphQL client implementation)
+  - REST client: 6-8 hours
+  - GraphQL client: 8-11 hours
+- Stage 3: 10-13 hours (includes firewall metrics conversion)
+- Stage 4: 4-5 hours (includes firewall metrics metadata)
 - Stage 5: 6-8 hours
 - Stage 6: 4-6 hours
 
-**Total**: ~30-40 hours
+**Total**: ~42-57 hours (increased from 30-40 due to GraphQL/firewall metrics)
 
 ---
 
 ## References
+
 - [CONTRIBUTING.md - Adding New Components](../../CONTRIBUTING.md#adding-new-components)
 - [Cloudflare Analytics API](https://developers.cloudflare.com/analytics/)
+- [Cloudflare GraphQL Analytics API](https://developers.cloudflare.com/analytics/graphql-api/)
+- [Querying Firewall Events with GraphQL](https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-firewall-events/)
 - [Cloudflare Go SDK v6](https://github.com/cloudflare/cloudflare-go)
 - [Azure Monitor Receiver](../azuremonitorreceiver) - Reference implementation
 - [lablabs/cloudflare-exporter](https://github.com/lablabs/cloudflare-exporter) - Inspiration
+- [GRAPHQL_RESEARCH.md](./GRAPHQL_RESEARCH.md) - GraphQL implementation research and examples
