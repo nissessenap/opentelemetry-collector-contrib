@@ -6,16 +6,26 @@
 
 **Recommendation**: Include basic firewall metrics in initial implementation - complexity is manageable.
 
+**PoC Status**: ✅ **COMPLETED & VALIDATED**
+
+- Successfully queried `firewallEventsAdaptiveGroups` via GraphQL
+- Tested with Zone.Analytics:Read permission (account-level not required for zone queries)
+- Confirmed low-cardinality approach works (action + source dimensions only)
+- Example output: `{action: "block", source: "firewallManaged", country: "BR", count: 1}`
+- Decision: **Exclude country dimension** based on PoC testing (see cardinality analysis below)
+
 ---
 
 ## GraphQL Support in Cloudflare Go SDK
 
 ### Official SDK (cloudflare-go v6)
+
 - ❌ **No built-in GraphQL support**
 - ✅ Provides REST API access only
 - Used for: Zone listing, account info, DNS records, etc.
 
 ### Third-Party Option
+
 - **Library**: `github.com/zeet-dev/cloudflare-graphql-go`
 - **Maturity**: Early stage (3 commits)
 - **Features**:
@@ -30,17 +40,20 @@
 ## GraphQL API Details
 
 ### Endpoint
+
 ```
 POST https://api.cloudflare.com/client/v4/graphql
 ```
 
 ### Authentication
+
 ```
 Authorization: Bearer <API_TOKEN>
 Content-Type: application/json
 ```
 
 ### Request Structure
+
 ```json
 {
   "query": "{ viewer { zones(filter: { zoneTag: $zoneTag }) { firewallEventsAdaptive(...) { ... } } } }",
@@ -59,9 +72,11 @@ Content-Type: application/json
 ## Firewall Events Data
 
 ### Dataset: `firewallEventsAdaptive`
+
 Available for individual events (for aggregations, use `firewallEventsAdaptiveGroups`)
 
 ### Available Fields (Low Cardinality)
+
 - ✅ `action` - Action taken (allow, block, challenge, jschallenge, log, connectionClose, etc.)
 - ✅ `source` - Source of event (waf, firewallRules, rateLimit, securityLevel, etc.)
 - ✅ `datetime` - Timestamp of event
@@ -69,6 +84,7 @@ Available for individual events (for aggregations, use `firewallEventsAdaptiveGr
 - ✅ `clientAsn` - Client ASN
 
 ### High Cardinality Fields (Use with Caution)
+
 - ⚠️ `ruleId` - Specific rule that triggered (hundreds/thousands of unique values)
 - ⚠️ `clientIP` - Client IP address
 - ⚠️ `clientRequestPath` - Request path
@@ -80,11 +96,14 @@ Available for individual events (for aggregations, use `firewallEventsAdaptiveGr
 ## Implementation Complexity Analysis
 
 ### Option 1: Use Third-Party Library
+
 **Pros**:
+
 - Saves some boilerplate code
 - Has type generation from schema
 
 **Cons**:
+
 - Immature library (3 commits)
 - No firewall queries pre-built
 - Extra dependency to maintain
@@ -93,19 +112,23 @@ Available for individual events (for aggregations, use `firewallEventsAdaptiveGr
 **Complexity**: Medium
 
 ### Option 2: Direct HTTP Client (Recommended)
+
 **Pros**:
+
 - Full control over queries
 - No extra dependencies beyond stdlib
 - Simple to understand and debug
 - Can use `net/http` package
 
 **Cons**:
+
 - More boilerplate code
 - Need to define our own types
 
 **Complexity**: Low-Medium
 
 ### Implementation Estimate
+
 - GraphQL client wrapper: 2-3 hours
 - Firewall events query: 2-3 hours
 - Type definitions: 1-2 hours
@@ -114,29 +137,45 @@ Available for individual events (for aggregations, use `firewallEventsAdaptiveGr
 
 ---
 
-## Recommended Metrics (Low Cardinality)
-
-### Account-Level Firewall
-```
-cloudflare.account.firewall.requests.total (by action)
-cloudflare.account.firewall.requests.by_source (by source)
-```
+## Recommended Metrics (Low Cardinality) ✅ FINAL
 
 ### Zone-Level Firewall
+
 ```
-cloudflare.zone.firewall.requests.total (by action, zone_id, zone_name)
-cloudflare.zone.firewall.requests.by_source (by source, zone_id, zone_name)
-cloudflare.zone.firewall.requests.by_country (by country, zone_id, zone_name)
+cloudflare.zone.firewall.requests (dimension: action, resource: zone_id, zone_name)
+cloudflare.zone.firewall.requests (dimension: source, resource: zone_id, zone_name)
 ```
 
-### Dimensions
-- **action**: allow, block, challenge, jschallenge, log, connectionClose, etc. (~10 values)
-- **source**: waf, firewallRules, rateLimit, securityLevel, etc. (~10 values)
-- **country**: ISO country codes (~200 values)
+### Dimensions (Included)
 
-**Cardinality Estimate**:
-- Per zone: ~10 (actions) + ~10 (sources) + ~200 (countries) = ~220 time series
-- For 100 zones: ~22,000 time series (acceptable for most metrics backends)
+- **action**: allow, block, challenge, jschallenge, log, connectionClose (~10 values) ✅
+  - **Use case**: Alert on spike in blocks (attack), challenges (bots)
+- **source**: waf, firewallManaged, firewallRules, rateLimit, securityLevel (~10 values) ✅
+  - **Use case**: Identify attack vector, rule effectiveness
+
+### Dimensions (Excluded After PoC Testing)
+
+- **country**: ISO country codes (~200 values) ❌
+  - **Reason**: High cardinality, not immediately actionable
+  - **PoC result**: Showed BR:1, NL:1 - interesting but not alert-worthy
+  - **Alternative**: Use Cloudflare dashboard for geographic drill-down
+- **rule_id**: Specific firewall rules (thousands of values) ❌
+  - **Reason**: Extremely high cardinality, forensics not operational monitoring
+- **clientIP, clientRequestPath, userAgent**: Individual identifiers ❌
+  - **Reason**: Log analysis domain
+
+**Final Cardinality Estimate**:
+
+- Per zone: 10 actions × 10 sources = **100 time series per zone**
+- For 100 zones: **10,000 time series** (very manageable!)
+- Reduced from initial: ~~220~~ → 100 time series per zone (~55% reduction)
+
+**What You Alert On**:
+
+- `rate(firewall.requests{action="block"}[5m]) > threshold` → Attack detected
+- `rate(firewall.requests{action="challenge"}[5m]) > threshold` → Bot spike
+- `firewall.requests{source="rateLimit"}` → Rate limiting triggered
+- Sudden changes in action/source distribution → New attack pattern
 
 ---
 
@@ -304,7 +343,9 @@ type FirewallEventsResponse struct {
 ## Recommendation for Implementation Plan
 
 ### Include in Initial Implementation ✅
+
 **Rationale**:
+
 1. Implementation complexity is **manageable** (8-11 hours)
 2. Direct HTTP approach is **simple** and has no extra dependencies
 3. Low cardinality metrics are **safe** for metrics backends
@@ -314,16 +355,19 @@ type FirewallEventsResponse struct {
 ### Staged Approach
 
 **Stage 2: Client Implementation**
+
 - Add GraphQL client alongside REST client
 - Implement `GetFirewallEventsByAction()`
 - Implement `GetFirewallEventsBySource()`
 
 **Stage 3: Scraper Implementation**
+
 - Add firewall events scraping
 - Aggregate by action and source
 - Convert to OTEL metrics
 
 **Stage 4: Metrics Metadata**
+
 - Define firewall metrics in metadata.yaml
 - Low cardinality dimensions only
 

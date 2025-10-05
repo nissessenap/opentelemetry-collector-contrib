@@ -135,7 +135,11 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
    - `Zone` struct (ID, Name, Status)
    - `AccountAnalytics` struct (account-level bandwidth, requests, threats)
    - `ZoneAnalytics` struct (per-zone bandwidth, requests, threats, pageviews)
-   - `FirewallAnalytics` struct (aggregated by action/source, NOT by rule_id)
+   - `FirewallAnalytics` struct:
+     - Aggregated by action and source only
+     - **NO** rule_id (high cardinality)
+     - **NO** country (use Cloudflare dashboard for geo analysis)
+     - Fields: action, source, count
    - `AnalyticsParams` struct (time ranges, filters)
 
 4. Create `internal/client/graphql_client.go` (separate file for GraphQL):
@@ -220,11 +224,11 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
        - `cloudflare.zone.pageviews.total` (Sum, count)
    - `firewallAnalyticsToMetrics(zone Zone, analytics FirewallAnalytics) pmetric.Metrics`
      - Firewall/WAF metrics (with zone_id, zone_name as attributes):
-       - `cloudflare.zone.firewall.requests.total` (Sum, count)
-       - `cloudflare.zone.firewall.requests.by_action` (Sum, count, dimension: action)
-         - Actions: allow, block, challenge, jschallenge, log, connectionClose
-       - `cloudflare.zone.firewall.requests.by_source` (Sum, count, dimension: source)
-         - Sources: waf, firewallRules, rateLimit, securityLevel, etc.
+       - `cloudflare.zone.firewall.requests` (Sum, count, dimension: action)
+         - Actions: allow, block, challenge, jschallenge, log, connectionClose (~10 values)
+       - `cloudflare.zone.firewall.requests` (Sum, count, dimension: source)
+         - Sources: waf, firewallManaged, firewallRules, rateLimit, securityLevel (~10 values)
+     - **Note**: Country dimension excluded to keep cardinality low. Users can drill down in Cloudflare dashboard for geographic analysis.
 
 4. Handle time ranges:
    - Use `collection_interval` to determine time range for analytics
@@ -273,16 +277,20 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
          description: Cloudflare zone name
          type: string
        cloudflare.firewall.action:
-         description: Firewall action taken (allow, block, challenge, etc.)
+         description: Firewall action taken (allow, block, challenge, jschallenge, log, connectionClose)
          type: string
+         enabled: true
        cloudflare.firewall.source:
-         description: Source of firewall event (waf, firewallRules, rateLimit, etc.)
+         description: Source of firewall event (waf, firewallManaged, firewallRules, rateLimit, securityLevel)
          type: string
+         enabled: true
      ```
 
    - Add `metrics` section with all account, zone, and firewall metrics
    - Define metric types (sum/gauge), units (bytes/count), descriptions
-   - Add optional attributes (action, source) - NO rule_id for cardinality reasons
+   - Firewall metric attributes: action, source only
+   - **Cardinality decision**: Exclude country, rule_id, clientIP, userAgent to keep metrics manageable
+   - Rationale: Geographic and detailed analysis should be done in Cloudflare dashboard
 
 2. Run code generation:
    - Execute `go generate ./...` to generate metadata code
@@ -476,6 +484,27 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 - Client interface can be extended without breaking existing code
 - Follows Open/Closed Principle
 
+### 7. Firewall Metrics Cardinality
+
+**Decision**: Only include `action` and `source` dimensions; exclude `country`, `rule_id`, `clientIP`, `userAgent`
+**Rationale**:
+
+- **Action** (~10 values): block, allow, challenge, jschallenge, log, connectionClose - essential for alerting
+- **Source** (~10 values): waf, firewallManaged, firewallRules, rateLimit - identifies attack vector
+- **Country** (~200 values): Excluded - creates high cardinality, geographic analysis better done in Cloudflare dashboard
+- **rule_id** (thousands): Excluded - extremely high cardinality, not actionable in metrics
+- **clientIP/userAgent**: Excluded - log analysis domain, not metrics
+
+**Total cardinality per zone**: ~10 (actions) × ~10 (sources) = ~100 time series (very manageable)
+
+**What to alert on**:
+- Spike in blocks → Possible attack
+- Spike in challenges → Bot activity
+- Rate changes → DDoS detection
+- Source pattern changes → New attack vectors
+
+**For deep analysis**: Users drill down in Cloudflare dashboard with full context (IPs, countries, rules, etc.)
+
 ---
 
 ## Open Questions
@@ -489,8 +518,13 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 1. **Zone Discovery** ✓: Auto-discover all zones by default, support explicit `zones` filter and `exclude_zones` exclusion (matches lablabs/cloudflare-exporter)
 2. **Account Metrics** ✓: Support account-level metrics out of the box (matches lablabs/cloudflare-exporter)
 3. **GraphQL Support** ✓: Implement direct HTTP client (no third-party library needed). See GRAPHQL_RESEARCH.md for details.
-4. **Metric Cardinality** ✓: Use aggregated firewall metrics by action/source only (NO rule_id). Estimated ~220 time series per zone = manageable cardinality.
+4. **Metric Cardinality** ✓: Use aggregated firewall metrics by action/source only. ~100 time series per zone (10 actions × 10 sources) = very manageable.
 5. **WAF/Firewall Metrics** ✓: Include in initial implementation using low-cardinality aggregations (~8-11 hours additional effort)
+6. **Country Dimension** ✓: **Excluded** from firewall metrics. Reasoning:
+   - High cardinality (~200 countries)
+   - Not immediately actionable (alerts focus on volume/rate, not location)
+   - Better analyzed in Cloudflare dashboard with full context
+   - Keeps metrics focused on operational monitoring vs deep forensics
 
 ---
 
