@@ -13,10 +13,13 @@ Verify that we can:
 ## Prerequisites
 
 1. **Cloudflare Account** with at least one zone
-2. **API Token** with Analytics:Read permission
+2. **API Token** with the correct permissions:
    - Go to: https://dash.cloudflare.com/profile/api-tokens
-   - Create Token → "Read analytics" template
-   - Or create custom token with `Analytics:Read` permission
+   - Click "Create Token"
+   - **Option 1**: Use "Read analytics" template (recommended)
+   - **Option 2**: Create custom token with these permissions:
+     - **Account** → **Analytics** → **Read** ✅ (Required for firewall events)
+     - **Zone** → **Analytics** → **Read** (for zone-level queries)
 3. **Zone ID** - Found in your Cloudflare dashboard under the zone overview
 
 ## Setup

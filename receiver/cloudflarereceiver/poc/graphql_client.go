@@ -50,7 +50,7 @@ type GraphQLError struct {
 }
 
 // Query executes a GraphQL query
-func (c *GraphQLClient) Query(ctx context.Context, query string, vars map[string]interface{}) (*GraphQLResponse, error) {
+func (c *GraphQLClient) Query(ctx context.Context, query string, vars map[string]interface{}, debug bool) (*GraphQLResponse, error) {
 	req := GraphQLRequest{
 		Query:     query,
 		Variables: vars,
@@ -59,6 +59,18 @@ func (c *GraphQLClient) Query(ctx context.Context, query string, vars map[string
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	if debug {
+		fmt.Println("\n=== DEBUG: Request ===")
+		fmt.Printf("Endpoint: %s\n", cloudflareGraphQLEndpoint)
+		tokenLen := len(c.apiToken)
+		if tokenLen > 10 {
+			fmt.Printf("API Token: %s...%s (length: %d)\n", c.apiToken[:5], c.apiToken[tokenLen-5:], tokenLen)
+		} else {
+			fmt.Printf("API Token: (too short - length: %d)\n", tokenLen)
+		}
+		fmt.Printf("Variables: %+v\n", vars)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", cloudflareGraphQLEndpoint, bytes.NewReader(body))
@@ -75,13 +87,23 @@ func (c *GraphQLClient) Query(ctx context.Context, query string, vars map[string
 	}
 	defer resp.Body.Close()
 
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if debug {
+		fmt.Println("\n=== DEBUG: Response ===")
+		fmt.Printf("Status Code: %d\n", resp.StatusCode)
+		fmt.Printf("Response Body: %s\n", string(bodyBytes))
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	var result GraphQLResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
@@ -109,7 +131,7 @@ type FirewallEventsResponse struct {
 }
 
 // GetFirewallEvents fetches aggregated firewall events for a zone
-func (c *GraphQLClient) GetFirewallEvents(ctx context.Context, zoneID string, since, until time.Time) (*FirewallEventsResponse, error) {
+func (c *GraphQLClient) GetFirewallEvents(ctx context.Context, zoneID string, since, until time.Time, debug bool) (*FirewallEventsResponse, error) {
 	query := `
 		query FirewallEventsByAction($zoneTag: String!, $since: Time!, $until: Time!) {
 			viewer {
@@ -140,7 +162,7 @@ func (c *GraphQLClient) GetFirewallEvents(ctx context.Context, zoneID string, si
 		"until":   until.Format(time.RFC3339),
 	}
 
-	resp, err := c.Query(ctx, query, vars)
+	resp, err := c.Query(ctx, query, vars, debug)
 	if err != nil {
 		return nil, err
 	}

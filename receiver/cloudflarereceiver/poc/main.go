@@ -15,31 +15,48 @@ func main() {
 	// Get configuration from environment variables
 	apiToken := os.Getenv("CF_API_TOKEN")
 	zoneID := os.Getenv("CF_ZONE_ID")
+	debug := os.Getenv("DEBUG") == "true"
 
 	if apiToken == "" {
 		fmt.Println("Error: CF_API_TOKEN environment variable is required")
+		fmt.Println("\nTo create an API token:")
+		fmt.Println("1. Go to https://dash.cloudflare.com/profile/api-tokens")
+		fmt.Println("2. Create Token -> Use 'Read analytics' template")
+		fmt.Println("3. Or create custom token with 'Account.Analytics:Read' permission")
 		os.Exit(1)
 	}
 
 	if zoneID == "" {
 		fmt.Println("Error: CF_ZONE_ID environment variable is required")
+		fmt.Println("\nTo find your Zone ID:")
+		fmt.Println("1. Go to your Cloudflare dashboard")
+		fmt.Println("2. Select a domain/zone")
+		fmt.Println("3. Look in the right sidebar for 'Zone ID'")
 		os.Exit(1)
 	}
+
+	fmt.Println("=== Cloudflare GraphQL Firewall Analytics PoC ===\n")
 
 	// Create GraphQL client
 	client := NewGraphQLClient(apiToken)
 
 	// Query firewall events for the last hour
 	until := time.Now().UTC()
-	since := until.Add(-1 * time.Hour)
+	since := until.Add(-10 * time.Hour)
 
-	fmt.Printf("Fetching firewall events for zone %s\n", zoneID)
-	fmt.Printf("Time range: %s to %s\n\n", since.Format(time.RFC3339), until.Format(time.RFC3339))
+	fmt.Printf("Zone ID: %s\n", zoneID)
+	fmt.Printf("Time range: %s to %s\n", since.Format(time.RFC3339), until.Format(time.RFC3339))
+	fmt.Printf("Debug mode: %v\n", debug)
 
 	ctx := context.Background()
-	result, err := client.GetFirewallEvents(ctx, zoneID, since, until)
+	result, err := client.GetFirewallEvents(ctx, zoneID, since, until, debug)
 	if err != nil {
-		fmt.Printf("Error fetching firewall events: %v\n", err)
+		fmt.Printf("\n❌ Error fetching firewall events: %v\n", err)
+		fmt.Println("\nTroubleshooting:")
+		fmt.Println("1. Verify your API token has 'Account.Analytics:Read' permission")
+		fmt.Println("2. Check that your Zone ID is correct")
+		fmt.Println("3. Try running with DEBUG=true for more details")
+		fmt.Println("4. Example: DEBUG=true CF_API_TOKEN=xxx CF_ZONE_ID=yyy go run .")
 		os.Exit(1)
 	}
 
