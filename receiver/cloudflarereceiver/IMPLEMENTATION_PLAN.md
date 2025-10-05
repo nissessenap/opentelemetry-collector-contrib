@@ -15,17 +15,19 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 ## Goals
 
 1. Add metrics collection capability to existing cloudflarereceiver
-2. Support Account-level analytics (requests, bandwidth, threats)
-3. Support Zone analytics (bandwidth, requests, threats, pageviews)
-4. Support Firewall/WAF analytics (by action and source - low cardinality)
-5. Use Cloudflare Go SDK v6 for REST API interactions
-6. Use GraphQL API directly (via HTTP client) for firewall analytics
-7. Auto-discover all zones in account by default with zone filtering support
-8. Design for extensibility (easy to add Workers, R2, Logpush metrics later)
-9. Maintain separation from existing logs functionality
+2. Support Zone analytics (bandwidth, requests, threats, pageviews)
+3. Support Firewall/WAF analytics (by action and source, country opt-in)
+4. Use Cloudflare Go SDK v6 for REST API interactions
+5. Use GraphQL API directly (via HTTP client) for firewall analytics
+6. Auto-discover all zones in account by default with zone filtering support
+7. Design for extensibility (easy to add account-level, Workers, R2, Logpush metrics later)
+8. Maintain separation from existing logs functionality
+9. Default collection_interval: 60 seconds (configurable)
+10. Resilient error handling: continue on partial failures
 
 ## Non-Goals (Future Extensions)
 
+- Account-level aggregated metrics (focus on zone-level initially)
 - Workers metrics
 - R2 storage metrics
 - Logpush job metrics
@@ -47,18 +49,21 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 
 1. Update `config.go`:
    - Add `MetricsConfig` struct with fields:
-     - `api_token` (string, required): Cloudflare API token
-     - `account_id` (string, required): Cloudflare account ID
+     - `api_token` (configopaque.String, required): Cloudflare API token (supports env var: `${env:CF_API_TOKEN}`)
+     - `account_id` (string, required): Cloudflare account ID (for zone discovery)
      - `zones` ([]string, optional): List of zone IDs to monitor (empty = all zones in account)
      - `exclude_zones` ([]string, optional): List of zone IDs to exclude from monitoring
-     - `enable_account_metrics` (bool, default: true): Enable account-level metrics
-     - `enable_zone_metrics` (bool, default: true): Enable per-zone metrics
+     - `collection_interval` (time.Duration, default: 60s): How often to scrape metrics
+     - `enable_zone_metrics` (bool, default: true): Enable per-zone HTTP analytics
      - `enable_firewall_metrics` (bool, default: true): Enable firewall/WAF metrics per zone
-     - `include_country_dimension` (bool, default: false): Include country dimension in firewall metrics (increases cardinality 200x)
+     - `include_country_dimension` (bool, default: false): Include country in firewall metrics (200x cardinality increase)
+   - Add `Metrics` field to main `Config` struct (sibling to `Logs`)
    - Add validation for metrics config:
-     - Require `api_token`
-     - Require `account_id`
+     - Require `api_token` if metrics configured
+     - Require `account_id` if metrics configured
      - Validate that `zones` and `exclude_zones` are not both set
+     - Validate that at least one of `Logs` or `Metrics` is configured
+     - **Decision**: Continue on partial zone failures, log errors
    - Ensure backward compatibility with existing `LogsConfig`
 
 2. Update `factory.go`:
@@ -501,54 +506,63 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 **Rationale**:
 
 **Always Included**:
+
 - **Action** (~10 values): block, allow, challenge, jschallenge, log, connectionClose - essential for alerting
 - **Source** (~10 values): waf, firewallManaged, firewallRules, rateLimit - identifies attack vector
 
 **Opt-In via `include_country_dimension: true`**:
+
 - **Country** (~200 values): Enables geographic threat analysis, geofencing, compliance monitoring
 - **Trade-off**: 200x cardinality increase (100 → 20,000 time series per zone)
 - **Use case**: Users with geographic security requirements or who need compatibility with lablabs/cloudflare-exporter
 
 **Always Excluded**:
+
 - **rule_id** (thousands): Extremely high cardinality, forensics not operational monitoring
 - **clientIP/userAgent**: Log analysis domain, not metrics
 
 **Cardinality Summary**:
+
 | Configuration | Per Zone | 100 Zones | Backend Requirements |
 |--------------|----------|-----------|---------------------|
 | Default (action + source) | ~100 | ~10,000 | Standard Prometheus |
 | With country enabled | ~20,000 | ~2,000,000 | Prometheus + Thanos/Mimir |
 
 **What to alert on (default)**:
+
 - Spike in blocks overall → Attack detected
 - Spike in challenges → Bot activity
 - Rate changes → DDoS detection
 - Source pattern changes → New attack vectors
 
 **Additional alerts (if country enabled)**:
+
 - Spike in blocks from specific country → Targeted geographic attack
 
 ---
 
 ## Open Questions
 
-1. **Sponsor**: Need to identify a maintainer/approver to sponsor this contribution
-2. **Rate Limiting**: What's the appropriate default collection_interval to avoid Cloudflare rate limits? (Recommendation: 60s)
-3. **Error Handling**: Should partial failures (one zone fails) fail entire scrape or just log error? (Recommendation: Log and continue)
+1. **Sponsor**: In progress - discussing with current code owner
 
 ## Resolved Questions
 
-1. **Zone Discovery** ✓: Auto-discover all zones by default, support explicit `zones` filter and `exclude_zones` exclusion (matches lablabs/cloudflare-exporter)
-2. **Account Metrics** ✓: Support account-level metrics out of the box (matches lablabs/cloudflare-exporter)
-3. **GraphQL Support** ✓: Implement direct HTTP client (no third-party library needed). See GRAPHQL_RESEARCH.md for details.
-4. **Metric Cardinality** ✓: Default to action/source dimensions (~100 time series per zone). Country opt-in via config.
-5. **WAF/Firewall Metrics** ✓: Include in initial implementation (~8-11 hours additional effort)
-6. **Country Dimension** ✓: **Opt-in configuration** (`include_country_dimension: false` by default). Reasoning:
-   - **Default (without country)**: Low cardinality (~100 per zone), works with standard Prometheus
-   - **Opt-in (with country)**: Enables geographic threat analysis, geofencing, compliance
-   - **User choice**: Balances observability needs with infrastructure capabilities
-   - **Flexibility**: Users with proper backends (Thanos/Mimir) can enable if needed
-   - Provides path for lablabs/cloudflare-exporter compatibility when required
+1. **Configuration Structure** ✓: `MetricsConfig` as sibling to `LogsConfig` in main `Config` struct (Option A)
+2. **Collection Interval** ✓: Default 60 seconds (configurable via `collection_interval`)
+3. **Error Handling** ✓: Continue on partial failures, emit metrics for successful zones, log errors (Option B)
+4. **Config Validation** ✓: Require at least one of `logs` or `metrics` to be configured
+5. **API Token Security** ✓: Support environment variables via `configopaque.String` (OTEL collector built-in support: `${env:CF_API_TOKEN}`)
+6. **Account vs Zone Metrics** ✓: Focus on zone-level metrics initially. Account-level metrics moved to future extensions.
+7. **Zone Discovery** ✓: Auto-discover all zones by default, support explicit `zones` filter and `exclude_zones` exclusion (matches lablabs/cloudflare-exporter)
+8. **GraphQL Support** ✓: Implement direct HTTP client (no third-party library needed). See GRAPHQL_RESEARCH.md for details.
+9. **Metric Cardinality** ✓: Default to action/source dimensions (~100 time series per zone). Country opt-in via config.
+10. **WAF/Firewall Metrics** ✓: Include in initial implementation (~8-11 hours additional effort)
+11. **Country Dimension** ✓: **Opt-in configuration** (`include_country_dimension: false` by default). Reasoning:
+    - **Default (without country)**: Low cardinality (~100 per zone), works with standard Prometheus
+    - **Opt-in (with country)**: Enables geographic threat analysis, geofencing, compliance
+    - **User choice**: Balances observability needs with infrastructure capabilities
+    - **Flexibility**: Users with proper backends (Thanos/Mimir) can enable if needed
+    - Provides path for lablabs/cloudflare-exporter compatibility when required
 
 ---
 
