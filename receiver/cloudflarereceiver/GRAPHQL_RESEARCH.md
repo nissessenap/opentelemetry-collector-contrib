@@ -10,9 +10,20 @@
 
 - Successfully queried `firewallEventsAdaptiveGroups` via GraphQL
 - Tested with Zone.Analytics:Read permission (account-level not required for zone queries)
-- Confirmed low-cardinality approach works (action + source dimensions only)
+- Confirmed aggregation approach works with action, source, and country dimensions
 - Example output: `{action: "block", source: "firewallManaged", country: "BR", count: 1}`
-- Decision: **Exclude country dimension** based on PoC testing (see cardinality analysis below)
+- Decision: **Country dimension opt-in** (`include_country_dimension: false` by default)
+  - Balances observability needs with infrastructure capacity
+  - Default: ~100 time series per zone (manageable for standard Prometheus)
+  - Opt-in: ~20,000 time series per zone (requires Thanos/Mimir)
+
+**Time Window Strategy**:
+
+- Default collection_interval: 60 seconds
+- Each scrape queries: `datetime_geq: lastScrapeTime, datetime_leq: now()`
+- Store last scrape timestamp to avoid gaps or overlaps
+- Example: If scraped at 10:00:00, next scrape at 10:01:00 queries [10:00:00 → 10:01:00]
+- Handles clock drift and delays gracefully
 
 ---
 
@@ -137,45 +148,60 @@ Available for individual events (for aggregations, use `firewallEventsAdaptiveGr
 
 ---
 
-## Recommended Metrics (Low Cardinality) ✅ FINAL
+## Recommended Metrics ✅ FINAL
 
 ### Zone-Level Firewall
 
 ```
-cloudflare.zone.firewall.requests (dimension: action, resource: zone_id, zone_name)
-cloudflare.zone.firewall.requests (dimension: source, resource: zone_id, zone_name)
+cloudflare.zone.firewall.requests
+  Resources: zone_id, zone_name
+  Dimensions (always): action, source
+  Dimensions (opt-in): country
 ```
 
-### Dimensions (Included)
+### Dimensions - Always Included
 
 - **action**: allow, block, challenge, jschallenge, log, connectionClose (~10 values) ✅
   - **Use case**: Alert on spike in blocks (attack), challenges (bots)
+  - **Essential**: Core operational metrics
 - **source**: waf, firewallManaged, firewallRules, rateLimit, securityLevel (~10 values) ✅
   - **Use case**: Identify attack vector, rule effectiveness
+  - **Essential**: Understanding what security layer is active
 
-### Dimensions (Excluded After PoC Testing)
+### Dimensions - Opt-In via Config
 
-- **country**: ISO country codes (~200 values) ❌
-  - **Reason**: High cardinality, not immediately actionable
-  - **PoC result**: Showed BR:1, NL:1 - interesting but not alert-worthy
-  - **Alternative**: Use Cloudflare dashboard for geographic drill-down
+- **country**: ISO country codes (~200 values) ⚙️ `include_country_dimension: true`
+  - **Use case**: Geographic threat analysis, geofencing, compliance
+  - **Trade-off**: 200x cardinality increase
+  - **When to enable**:
+    - Geographic security requirements
+    - Need compatibility with lablabs/cloudflare-exporter
+    - Have proper metrics backend (Thanos/Mimir)
+
+### Dimensions - Always Excluded
+
 - **rule_id**: Specific firewall rules (thousands of values) ❌
   - **Reason**: Extremely high cardinality, forensics not operational monitoring
 - **clientIP, clientRequestPath, userAgent**: Individual identifiers ❌
   - **Reason**: Log analysis domain
 
-**Final Cardinality Estimate**:
+**Cardinality Summary**:
 
-- Per zone: 10 actions × 10 sources = **100 time series per zone**
-- For 100 zones: **10,000 time series** (very manageable!)
-- Reduced from initial: ~~220~~ → 100 time series per zone (~55% reduction)
+| Configuration | Per Zone | 100 Zones | Backend |
+|--------------|----------|-----------|---------|
+| **Default** (action + source) | ~100 | ~10,000 | Standard Prometheus |
+| **With country** | ~20,000 | ~2,000,000 | Prometheus + Thanos/Mimir |
 
-**What You Alert On**:
+**What You Alert On (Default)**:
 
 - `rate(firewall.requests{action="block"}[5m]) > threshold` → Attack detected
 - `rate(firewall.requests{action="challenge"}[5m]) > threshold` → Bot spike
 - `firewall.requests{source="rateLimit"}` → Rate limiting triggered
 - Sudden changes in action/source distribution → New attack pattern
+
+**Additional Alerts (If Country Enabled)**:
+
+- `rate(firewall.requests{action="block",country="XX"}[5m]) > threshold` → Targeted attack from country
 
 ---
 

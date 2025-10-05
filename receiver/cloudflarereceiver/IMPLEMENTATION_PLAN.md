@@ -54,6 +54,7 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
      - `enable_account_metrics` (bool, default: true): Enable account-level metrics
      - `enable_zone_metrics` (bool, default: true): Enable per-zone metrics
      - `enable_firewall_metrics` (bool, default: true): Enable firewall/WAF metrics per zone
+     - `include_country_dimension` (bool, default: false): Include country dimension in firewall metrics (increases cardinality 200x)
    - Add validation for metrics config:
      - Require `api_token`
      - Require `account_id`
@@ -136,10 +137,10 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
    - `AccountAnalytics` struct (account-level bandwidth, requests, threats)
    - `ZoneAnalytics` struct (per-zone bandwidth, requests, threats, pageviews)
    - `FirewallAnalytics` struct:
-     - Aggregated by action and source only
-     - **NO** rule_id (high cardinality)
-     - **NO** country (use Cloudflare dashboard for geo analysis)
-     - Fields: action, source, count
+     - Always includes: action, source, count
+     - Optionally includes: country (if configured)
+     - **NO** rule_id (extremely high cardinality)
+     - Fields: action, source, country (nullable), count
    - `AnalyticsParams` struct (time ranges, filters)
 
 4. Create `internal/client/graphql_client.go` (separate file for GraphQL):
@@ -222,13 +223,15 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
        - `cloudflare.zone.requests.uncached` (Sum, count)
        - `cloudflare.zone.threats.total` (Sum, count)
        - `cloudflare.zone.pageviews.total` (Sum, count)
-   - `firewallAnalyticsToMetrics(zone Zone, analytics FirewallAnalytics) pmetric.Metrics`
+   - `firewallAnalyticsToMetrics(zone Zone, analytics FirewallAnalytics, includeCountry bool) pmetric.Metrics`
      - Firewall/WAF metrics (with zone_id, zone_name as attributes):
-       - `cloudflare.zone.firewall.requests` (Sum, count, dimension: action)
-         - Actions: allow, block, challenge, jschallenge, log, connectionClose (~10 values)
-       - `cloudflare.zone.firewall.requests` (Sum, count, dimension: source)
-         - Sources: waf, firewallManaged, firewallRules, rateLimit, securityLevel (~10 values)
-     - **Note**: Country dimension excluded to keep cardinality low. Users can drill down in Cloudflare dashboard for geographic analysis.
+       - `cloudflare.zone.firewall.requests` (Sum, count)
+         - **Default dimensions**: action, source (~100 time series per zone)
+           - Actions: allow, block, challenge, jschallenge, log, connectionClose (~10 values)
+           - Sources: waf, firewallManaged, firewallRules, rateLimit, securityLevel (~10 values)
+         - **Optional dimension** (if `include_country_dimension: true`): country (~20,000 time series per zone)
+           - Countries: ISO country codes (~200 values)
+     - **Note**: Country dimension opt-in to balance observability with cardinality management.
 
 4. Handle time ranges:
    - Use `collection_interval` to determine time range for analytics
@@ -284,13 +287,21 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
          description: Source of firewall event (waf, firewallManaged, firewallRules, rateLimit, securityLevel)
          type: string
          enabled: true
+       cloudflare.firewall.country:
+         description: Client country (ISO code)
+         type: string
+         enabled: false  # Opt-in via config
      ```
 
    - Add `metrics` section with all account, zone, and firewall metrics
    - Define metric types (sum/gauge), units (bytes/count), descriptions
-   - Firewall metric attributes: action, source only
-   - **Cardinality decision**: Exclude country, rule_id, clientIP, userAgent to keep metrics manageable
-   - Rationale: Geographic and detailed analysis should be done in Cloudflare dashboard
+   - Firewall metric attributes:
+     - **Always**: action (~10), source (~10)
+     - **Optional**: country (~200) - enabled via `include_country_dimension: true`
+   - **Cardinality**:
+     - Default: ~100 time series per zone (action × source)
+     - With country: ~20,000 time series per zone (action × source × country)
+   - **Excluded**: rule_id (thousands of values), clientIP, userAgent (log analysis domain)
 
 2. Run code generation:
    - Execute `go generate ./...` to generate metadata code
@@ -486,24 +497,36 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 
 ### 7. Firewall Metrics Cardinality
 
-**Decision**: Only include `action` and `source` dimensions; exclude `country`, `rule_id`, `clientIP`, `userAgent`
+**Decision**: Include `action` and `source` dimensions by default; make `country` opt-in via configuration
 **Rationale**:
 
+**Always Included**:
 - **Action** (~10 values): block, allow, challenge, jschallenge, log, connectionClose - essential for alerting
 - **Source** (~10 values): waf, firewallManaged, firewallRules, rateLimit - identifies attack vector
-- **Country** (~200 values): Excluded - creates high cardinality, geographic analysis better done in Cloudflare dashboard
-- **rule_id** (thousands): Excluded - extremely high cardinality, not actionable in metrics
-- **clientIP/userAgent**: Excluded - log analysis domain, not metrics
 
-**Total cardinality per zone**: ~10 (actions) × ~10 (sources) = ~100 time series (very manageable)
+**Opt-In via `include_country_dimension: true`**:
+- **Country** (~200 values): Enables geographic threat analysis, geofencing, compliance monitoring
+- **Trade-off**: 200x cardinality increase (100 → 20,000 time series per zone)
+- **Use case**: Users with geographic security requirements or who need compatibility with lablabs/cloudflare-exporter
 
-**What to alert on**:
-- Spike in blocks → Possible attack
+**Always Excluded**:
+- **rule_id** (thousands): Extremely high cardinality, forensics not operational monitoring
+- **clientIP/userAgent**: Log analysis domain, not metrics
+
+**Cardinality Summary**:
+| Configuration | Per Zone | 100 Zones | Backend Requirements |
+|--------------|----------|-----------|---------------------|
+| Default (action + source) | ~100 | ~10,000 | Standard Prometheus |
+| With country enabled | ~20,000 | ~2,000,000 | Prometheus + Thanos/Mimir |
+
+**What to alert on (default)**:
+- Spike in blocks overall → Attack detected
 - Spike in challenges → Bot activity
 - Rate changes → DDoS detection
 - Source pattern changes → New attack vectors
 
-**For deep analysis**: Users drill down in Cloudflare dashboard with full context (IPs, countries, rules, etc.)
+**Additional alerts (if country enabled)**:
+- Spike in blocks from specific country → Targeted geographic attack
 
 ---
 
@@ -518,13 +541,14 @@ Extend the existing Cloudflare receiver to support metrics collection from Cloud
 1. **Zone Discovery** ✓: Auto-discover all zones by default, support explicit `zones` filter and `exclude_zones` exclusion (matches lablabs/cloudflare-exporter)
 2. **Account Metrics** ✓: Support account-level metrics out of the box (matches lablabs/cloudflare-exporter)
 3. **GraphQL Support** ✓: Implement direct HTTP client (no third-party library needed). See GRAPHQL_RESEARCH.md for details.
-4. **Metric Cardinality** ✓: Use aggregated firewall metrics by action/source only. ~100 time series per zone (10 actions × 10 sources) = very manageable.
-5. **WAF/Firewall Metrics** ✓: Include in initial implementation using low-cardinality aggregations (~8-11 hours additional effort)
-6. **Country Dimension** ✓: **Excluded** from firewall metrics. Reasoning:
-   - High cardinality (~200 countries)
-   - Not immediately actionable (alerts focus on volume/rate, not location)
-   - Better analyzed in Cloudflare dashboard with full context
-   - Keeps metrics focused on operational monitoring vs deep forensics
+4. **Metric Cardinality** ✓: Default to action/source dimensions (~100 time series per zone). Country opt-in via config.
+5. **WAF/Firewall Metrics** ✓: Include in initial implementation (~8-11 hours additional effort)
+6. **Country Dimension** ✓: **Opt-in configuration** (`include_country_dimension: false` by default). Reasoning:
+   - **Default (without country)**: Low cardinality (~100 per zone), works with standard Prometheus
+   - **Opt-in (with country)**: Enables geographic threat analysis, geofencing, compliance
+   - **User choice**: Balances observability needs with infrastructure capabilities
+   - **Flexibility**: Users with proper backends (Thanos/Mimir) can enable if needed
+   - Provides path for lablabs/cloudflare-exporter compatibility when required
 
 ---
 
